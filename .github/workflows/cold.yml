@@ -1,0 +1,53 @@
+name: 冷知识推送
+
+on:
+  schedule:
+    # GitHub Actions 用 UTC 时间。
+    # UTC 04:00 = 北京时间 12:00；UTC 09:40 = 北京时间 17:40
+    - cron: '0 4 * * *'
+    - cron: '40 9 * * *'
+
+  # 允许在网页上手动点一下立刻运行（测试用）
+  workflow_dispatch:
+
+# 提交「已推送清单」需要写权限
+permissions:
+  contents: write
+
+# 防止两次运行重叠（午间/傍晚相隔 5 个多小时，基本不会，但保险）
+concurrency:
+  group: cold-knowledge
+  cancel-in-progress: false
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 拉取仓库
+        uses: actions/checkout@v4
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 推送冷知识到微信
+        env:
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+        run: python cold_knowledge.py
+
+      # 推送成功后脚本会往《冷知识_已推送清单.md》追加一行；
+      # 这里把它提交回仓库，跨天查重才不丢。
+      - name: 提交已推送清单
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add 冷知识_已推送清单.md
+          if git diff --staged --quiet; then
+            echo "清单无变化，跳过提交"
+          else
+            git commit -m "chore: update cold-knowledge ledger $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            git push
+          fi
