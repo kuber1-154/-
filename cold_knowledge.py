@@ -167,10 +167,14 @@ def pick(entries, ledger):
 def build_message(e):
     return (
         "{}｜{}\n\n{}\n\n"
+        "补充：{}\n"
         "为什么有意思：{}\n"
         "来源：{}\n"
         "今日小问题：{}"
-    ).format(e["领域"], e["标题"], e["正文"], e["为什么"], e["来源"], e["小问题"])
+    ).format(
+        e["领域"], e["标题"], e["正文"], e.get("补充", ""),
+        e["为什么"], e["来源"], e["小问题"],
+    )
 
 
 def push(token, title, content):
