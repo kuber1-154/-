@@ -260,7 +260,8 @@ def build_user_prompt(items, now):
         "   六、主线串联（今天发生了什么 → 下一步可能发生什么 → 影响谁，"
         "体现科技-政治-经济联动）\n"
         "   七、关注信号与概率（高 / 中 / 低，各说明依据）\n"
-        "   八、来源链接（列出你实际用到的链接）\n"
+        "   八、来源链接（**最多只列 12 条**，挑今日必看/主线里最关键的，"
+        "不要把素材里的链接全部罗列，否则正文超长会被推送平台拒发）\n"
         "2. 只使用素材里出现的事实与数字，重要条目和关键数据必须附素材里的链接；"
         "素材里没有的一律不写，禁止编造新闻、数字、日期、公司名。\n"
         "3. 区分【事实】与【推断/预测】：媒体推测、消息人士、知情人士内容必须"
@@ -268,7 +269,7 @@ def build_user_prompt(items, now):
         "4. 日历只写：素材中已确认的日程；或你训练知识中高度确定的例行日程"
         "（如中国 LPR 每月 20 日公布、美国非农每月首个周五、美联储议息按官方日历）；"
         "日期不确定的一律写「待定」或省略，禁止编造日期。\n"
-        "5. 风格：中立、简洁、不标题党；总字数 2800-3000 字；素材极少时相应缩短"
+        "5. 风格：中立、简洁、不标题党；总字数严格控制在 2800-3200 字（含链接）；素材极少时相应缩短"
         "并说明；确实没有大事时直说「今天无重大更新」。\n"
         "6. 输出纯 Markdown 正文，不要用代码块包裹，不要写任何解释性前言。\n\n"
         "新闻素材：\n{items}"
@@ -288,7 +289,7 @@ def call_deepseek(api_key, prompt):
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.3,
-        "max_tokens": 8000,
+        "max_tokens": 5000,
         "stream": False,
     }
     headers = {"Content-Type": "application/json", "Authorization": "Bearer " + api_key}
@@ -397,6 +398,16 @@ def _run(dry, now):
         print("[info] 写稿失败，使用摘要版降级")
         content = fallback_digest(items, now)
         title += "（摘要版）"
+
+    # PushPlus 单条正文上限 2 万字，超出会被服务端拒发（code 999「发送内容过大」）。
+    # 这里做硬截断兜底，保证任何情况下都能推出去。
+    MAX_CONTENT = 18000
+    if len(content) > MAX_CONTENT:
+        head = content[:MAX_CONTENT]
+        cut = head.rfind("\n")
+        if cut > MAX_CONTENT * 0.8:
+            head = head[:cut]
+        content = head.rstrip() + "\n\n…（正文过长，已截断；要点以上方为准）"
 
     if dry:
         print("=" * 60)
