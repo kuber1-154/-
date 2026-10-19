@@ -6,12 +6,13 @@
 设计要点
 --------
 1. 只用 Python 标准库，不需要 pip install 任何东西。
-2. 新闻源全部免费、无需 Key：Bing 新闻 RSS + Google 新闻 RSS + BBC 中文 RSS。
+2. 新闻源全部免费、无需 Key：Google 新闻总榜(最稳) + Bing 新闻 RSS + Google 搜索 RSS + BBC 中文 RSS。
    每个源独立 try，挂了只跳过它，不影响整体。
 3. 时效防线：只保留最近 48 小时发布的条目，防止某个源吐旧新闻污染早报。
 4. DeepSeek 写稿失败（网络/欠费/限流）时，自动降级为「新闻列表摘要版」，
    保证每天 8:00 手机一定收到东西。
-5. 写稿提示词强制「只用素材、附链接、不编造、区分事实/预测」，与人工早报同款八段格式。
+5. 永不静默断更：采集到 0 条会自动重试；仍失败则给你推一条「降级通知」；
+   写稿、推送等任何异常都会兜底推微信告警，绝不让你一声不响收不到信息。
 
 用法
 ----
@@ -107,6 +108,19 @@ def _item_date(el):
         return None
 
 
+def clean_link(url):
+    """Bing 新闻 RSS 的链接是 apiclick.aspx 跳转链，里面包着真实地址，解出来变直链。"""
+    try:
+        p = urllib.parse.urlparse(url)
+        if "bing.com" in (p.netloc or "") and "apiclick" in (p.path or ""):
+            real = (urllib.parse.parse_qs(p.query).get("url") or [""])[0]
+            if real.startswith("http"):
+                return real
+    except Exception:
+        pass
+    return url
+
+
 def parse_feed(xml_text, max_age_h=48):
     """把 RSS/Atom 解析成 [{title, link, desc}]，只保留最近 max_age_h 小时。"""
     out = []
@@ -122,8 +136,14 @@ def parse_feed(xml_text, max_age_h=48):
             continue
 
         dt = _item_date(el)
-        if dt is not None and (now - dt).total_seconds() > max_age_h * 3600:
-            continue
+        if dt is not None:
+            try:
+                if (now - dt).total_seconds() > max_age_h * 3600:
+                    continue
+            except TypeError:
+                # 有些源的 pubDate 不带时区，解析成 naive datetime，与 UTC 相减会报错；
+                # 视为不算过期、直接保留，而不是把整条丢弃。
+                pass
 
         t = _child(el, "title")
         l = _child(el, "link")
@@ -131,7 +151,7 @@ def parse_feed(xml_text, max_age_h=48):
         title = strip_tags(t.text) if t is not None and t.text else ""
         if l is None:
             continue
-        link = (l.get("href") or l.text or "").strip()
+        link = clean_link((l.get("href") or l.text or "").strip())
         if not title or not link.startswith("http"):
             continue
         desc = strip_tags(d.text) if d is not None and d.text else ""
@@ -153,13 +173,21 @@ def fetch_google(query):
     return parse_feed(http_get(url, retries=2))
 
 
+def fetch_google_top():
+    """Google 新闻中文总榜（不带关键词），比搜索 RSS 更稳定，作为兜底源。"""
+    url = "https://news.google.com/rss?hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
+    return parse_feed(http_get(url, retries=3))
+
+
 def fetch_bbc():
     url = "https://feeds.bbci.co.uk/zhongwen/simp/rss.xml"
     return parse_feed(http_get(url, retries=2))
 
 
-# 每个源都是「喂一个参数」，独立 try，坏了只跳它
+# 每个源都是「喂一个参数」，独立 try，坏了只跳它。
+# 第一个放最稳的 Google 总榜，保证即使其它源全挂也有兜底。
 SOURCES = [
+    ("google_top", ""),
     ("bing", "人工智能 大模型 半导体 芯片"),
     ("bing", "中东 俄乌 国际政治"),
     ("bing", "央行 利率 通胀 宏观经济"),
@@ -191,6 +219,8 @@ def collect_news():
                 add(fetch_bing(arg), "Bing新闻")
             elif kind == "google":
                 add(fetch_google(arg), "Google新闻")
+            elif kind == "google_top":
+                add(fetch_google_top(), "Google新闻")
             else:
                 add(fetch_bbc(), "BBC中文")
         except Exception as exc:
@@ -297,6 +327,7 @@ def fallback_digest(items, now):
 # ---------------------------------------------------------------- 推送
 
 def push(token, title, content):
+    """推送到 PushPlus，返回是否成功（True/False）。任何异常都吃掉并返回 False。"""
     payload = json.dumps(
         {"token": token, "title": title, "content": content, "template": "markdown"},
         ensure_ascii=False,
@@ -306,22 +337,53 @@ def push(token, title, content):
         data=payload,
         headers={**UA, "Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=30) as r:
-        res = json.loads(r.read().decode("utf-8", "replace"))
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            res = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception as exc:
+        print("[error] 推送请求失败: {}".format(exc), file=sys.stderr)
+        return False
     print(json.dumps(res, ensure_ascii=False))
     return res.get("code") == 200
 
 
-def main():
-    dry = "--dry-run" in sys.argv
-    now = datetime.now(CST)
+def _alert(token, title, content):
+    """尽力推一条告警消息，绝不抛异常（兜底用）。"""
+    token = (token or "").strip()
+    if not token:
+        return False
+    try:
+        return push(token, title, content)
+    except Exception:
+        return False
 
+
+# ---------------------------------------------------------------- 主流程
+
+def _run(dry, now):
     print("[info] 开始收集新闻…")
     items = collect_news()
     print("[info] 共收集 {} 条新闻".format(len(items)))
+
     if not items:
-        print("[error] 没有收集到任何新闻，跳过推送", file=sys.stderr)
-        return 1
+        print("[warn] 第一次采集到 0 条，30 秒后重试一次", file=sys.stderr)
+        time.sleep(30)
+        items = collect_news()
+        print("[info] 重试后共 {} 条新闻".format(len(items)))
+
+    if not items:
+        msg = (
+            "📰 早报降级通知\n\n"
+            "⚠️ 今天的新闻源采集失败（重试后仍为 0 条），早报未能生成。\n"
+            "大概率是新闻 RSS 对机房 IP 限流，一般明天会自动恢复；\n"
+            "也可现在去 GitHub Actions 手动 Rerun 一次。"
+        )
+        if dry:
+            print(msg)
+            return 0
+        ok = _alert(os.environ.get("PUSHPLUS_TOKEN", ""), "📰 早报降级通知", msg)
+        print("[info] 已推送降级通知" if ok else "[fail] 降级通知也推送失败")
+        return 0 if ok else 1
 
     title = "📰 科技政经早报 · {}月{}日".format(now.month, now.day)
     api_key = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
@@ -353,6 +415,24 @@ def main():
     ok = push(token, title, content)
     print("[ok] 推送成功" if ok else "[fail] 推送失败")
     return 0 if ok else 1
+
+
+def main():
+    dry = "--dry-run" in sys.argv
+    now = datetime.now(CST)
+
+    # 兜底：任何没被内部吃掉的异常，都推一条微信告警，避免「一声不响」断更。
+    try:
+        return _run(dry, now)
+    except Exception as exc:
+        print("[fatal] {}: {}".format(type(exc).__name__, exc), file=sys.stderr)
+        if not dry:
+            _alert(
+                os.environ.get("PUSHPLUS_TOKEN", ""),
+                "📰 早报脚本异常",
+                "⚠️ 早报脚本运行崩溃：{}\n请查看 GitHub Actions 该次运行日志。".format(exc),
+            )
+        return 1
 
 
 if __name__ == "__main__":
